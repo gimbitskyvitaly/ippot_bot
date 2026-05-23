@@ -217,17 +217,37 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wb.close()
             return
         
+        # Сначала соберём все user_id из таблицы
+        user_ids_in_table = []
+        for row in range(2, ws.max_row + 1):
+            user_id = ws.cell(row=row, column=1).value
+            user_ids_in_table.append(str(user_id))
+        
         message = "📊 Статистика посещаемости:\n\n"
+        
+        # Проходим по таблице и показываем данные
         for row in range(2, min(ws.max_row + 1, 11)):  # Показываем топ-10
             user_id = ws.cell(row=row, column=1).value
             attendance = ws.cell(row=row, column=2).value
             
-            # Получаем имя пользователя (попытка)
+            # Пытаемся получить имя пользователя, но не критично если не получится
+            username = None
             try:
                 user = await context.bot.get_chat(user_id)
-                username = user.first_name
-            except:
-                username = str(user_id)
+                if user.first_name:
+                    username = user.first_name
+                    if user.last_name:
+                        username += f" {user.last_name}"
+                    if user.username:
+                        username += f" (@{user.username})"
+                elif user.username:
+                    username = f"@{user.username}"
+            except Exception as e:
+                logger.debug(f"Не удалось получить имя для {user_id}: {e}")
+            
+            # Если не удалось получить имя, используем ID или сохраняем как есть
+            if username is None:
+                username = f"User_{user_id}"
             
             message += f"{username}: {attendance}%\n"
         
@@ -236,9 +256,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(message)
         wb.close()
+    except FileNotFoundError:
+        logger.error("Файл Excel не найден")
+        await update.message.reply_text("Файл статистики не найден. Возможно, бот ещё не обрабатывал голосования.")
     except Exception as e:
         logger.error(f"Ошибка при получении статуса: {e}")
-        await update.message.reply_text("Произошла ошибка при получении статистики.")
+        await update.message.reply_text(f"Произошла ошибка при получении статистики: {str(e)}")
 
 
 async def test_poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -266,9 +289,15 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     poll_answer = update.poll_answer
     
     try:
+        logger.info(f"Получен ответ на опрос от пользователя {poll_answer.user_id}")
+        logger.info(f"ID опроса: {poll_answer.poll_id}")
+        logger.info(f"Выбранные варианты: {poll_answer.option_ids}")
+        
         # Получаем информацию об опросе
         poll = await context.bot.get_poll(poll_answer.poll_id)
         question = poll.question
+        
+        logger.info(f"Вопрос опроса: {question}")
         
         # Извлекаем дату из вопроса
         parts = question.split()
@@ -276,23 +305,32 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             date_str = parts[1]  # Формат DD.MM
         else:
             date_str = datetime.now().strftime('%d.%m')
+            logger.warning(f"Не удалось извлечь дату из вопроса, используем текущую: {date_str}")
         
         # Получаем информацию о пользователе
         user = await context.bot.get_chat(poll_answer.user_id)
         username = user.first_name or user.username or str(poll_answer.user_id)
         
+        logger.info(f"Пользователь: {username} ({poll_answer.user_id})")
+        
         # Определяем значение голоса
-        option_index = poll_answer.option_ids[0] if poll_answer.option_ids else 0
+        if not poll_answer.option_ids:
+            logger.warning("Пользователь не выбрал вариант ответа")
+            return
+            
+        option_index = poll_answer.option_ids[0]
         # "иду" = 1, "плачу" = 0, "не иду" = 0
         vote_value = 1 if option_index == 0 else 0
+        
+        logger.info(f"Выбранный вариант: {option_index}, значение: {vote_value} ({'иду' if vote_value == 1 else 'не идёт'})")
         
         # Записываем в таблицу
         record_vote(str(poll_answer.user_id), username, date_str, vote_value)
         
-        logger.info(f"Голос обработан: {username} -> {'иду' if vote_value == 1 else 'не идёт'} на {date_str}")
+        logger.info(f"✅ Голос успешно записан: {username} -> {'иду' if vote_value == 1 else 'не идёт'} на {date_str}")
         
     except Exception as e:
-        logger.error(f"Ошибка при обработке ответа на опрос: {e}")
+        logger.error(f"❌ Ошибка при обработке ответа на опрос: {e}", exc_info=True)
 
 
 async def scheduled_task(context: ContextTypes.DEFAULT_TYPE):
