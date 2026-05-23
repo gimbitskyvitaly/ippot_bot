@@ -621,6 +621,12 @@ async def handle_feedback_message(update: Update, context: ContextTypes.DEFAULT_
         user_id = str(update.effective_user.id)
         message_text = update.message.text.strip()
         
+        # Проверяем, не находится ли пользователь в процессе создания опроса
+        # Если да - игнорируем сообщение (оно обрабатывается ConversationHandler)
+        if context.user_data.get('poll_date') is not None:
+            logger.debug(f"Игнорируем сообщение от {user_id}, так как пользователь в диалоге создания опроса")
+            return
+        
         # Проверяем, является ли сообщение числом от 1 до 10 (оценка)
         try:
             rating = int(message_text)
@@ -804,6 +810,7 @@ def main():
     
     # Обработчики текстовых сообщений для фидбэка
     # Универсальный обработчик для оценок и текстового фидбэка
+    # Важно: должен быть после ConversationHandler, чтобы не перехватывать сообщения во время диалога
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feedback_message))
     
     # Добавляем ежедневную задачу в 10:00 для отправки опросов
