@@ -31,6 +31,11 @@ THREAD_ID = None  # Укажите ID темы "опросы", если груп
 EXCEL_FILE = "attendance.xlsx"
 
 
+# Глобальное хранилище для связи ID опроса с данными тренировки
+# Формат: { poll_id: {"date": "DD.MM", "time": "HH:MM", "location": "LOC"} }
+active_polls = {}
+
+
 def get_next_friday():
     """Возвращает дату следующей пятницы."""
     today = datetime.now().date()
@@ -152,7 +157,7 @@ def record_vote(user_id: str, username: str, training_date: str, vote_value: int
     wb.close()
 
 
-async def send_poll(application, title: str, training_date: str):
+async def send_poll(application, title: str, training_date: str, time_str: str, location: str):
     """Отправляет опрос в группу."""
     try:
         poll = await application.bot.send_poll(
@@ -165,6 +170,15 @@ async def send_poll(application, title: str, training_date: str):
         )
         logger.info(f"Опрос отправлен: {title}")
         logger.info(f"ID опроса: {poll.poll.id}")
+        
+        # Сохраняем связь ID опроса и данных тренировки
+        active_polls[poll.poll.id] = {
+            "date": training_date,
+            "time": time_str,
+            "location": location
+        }
+        logger.info(f"Опрос {poll.poll.id} сохранен для даты {training_date} {time_str} {location}")
+        
         return poll.poll.id
     except Exception as e:
         logger.error(f"Ошибка при отправке опроса: {e}")
@@ -174,15 +188,17 @@ async def send_poll(application, title: str, training_date: str):
 async def send_friday_poll(application):
     """Отправляет опрос для пятничной тренировки."""
     friday_date = get_next_friday()
-    title = f"Тренировка {friday_date.strftime('%d.%m')} 18:00 БНТУ"
-    await send_poll(application, title, friday_date.strftime('%d.%m'))
+    date_str = friday_date.strftime('%d.%m')
+    title = f"Тренировка {date_str} 18:00 БНТУ"
+    await send_poll(application, title, date_str, "18:00", "БНТУ")
 
 
 async def send_sunday_poll(application):
     """Отправляет опрос для воскресной тренировки."""
     sunday_date = get_next_sunday()
-    title = f"Тренировка {sunday_date.strftime('%d.%m')} 10:00 РГУОР"
-    await send_poll(application, title, sunday_date.strftime('%d.%m'))
+    date_str = sunday_date.strftime('%d.%m')
+    title = f"Тренировка {date_str} 10:00 РГУОР"
+    await send_poll(application, title, date_str, "10:00", "РГУОР")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -280,7 +296,7 @@ async def test_poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     test_date = datetime.now().strftime('%d.%m')
     title = f"ТЕСТ Тренировка {test_date}"
     
-    await send_poll(context.application, title, test_date)
+    await send_poll(context.application, title, test_date, "18:00", "БНТУ")
     await update.message.reply_text("Тестовый опрос отправлен!")
 
 
@@ -295,22 +311,21 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.info(f"ID опроса: {poll_answer.poll_id}")
         logger.info(f"Выбранные варианты: {poll_answer.option_ids}")
         
-        # Получаем информацию об опросе через get_message
-        message = await context.bot.get_message(
-            chat_id=poll_answer.voter_chat.id if hasattr(poll_answer, 'voter_chat') else GROUP_ID,
-            message_id=poll_answer.message_id
-        )
-        question = message.poll.question if message.poll else "Неизвестный опрос"
+        # Получаем информацию об опросе из глобального хранилища или извлекаем из вопроса
+        training_data = active_polls.get(poll_answer.poll_id)
         
-        logger.info(f"Вопрос опроса: {question}")
-        
-        # Извлекаем дату из вопроса
-        parts = question.split()
-        if len(parts) >= 2:
-            date_str = parts[1]  # Формат DD.MM
+        if training_data:
+            date_str = training_data["date"]
+            time_str = training_data["time"]
+            location = training_data["location"]
+            question = f"Тренировка {date_str} {time_str} {location}"
+            logger.info(f"Найдены данные опроса: {question}")
         else:
+            # Если опрос не найден в хранилище (например, после перезапуска бота),
+            # пытаемся извлечь дату из текста вопроса через get_updates
+            logger.warning(f"Опрос {poll_answer.poll_id} не найден в активном хранилище")
             date_str = datetime.now().strftime('%d.%m')
-            logger.warning(f"Не удалось извлечь дату из вопроса, используем текущую: {date_str}")
+            logger.warning(f"Используем текущую дату: {date_str}")
         
         # Получаем информацию о пользователе
         user = await context.bot.get_chat(user_id)
