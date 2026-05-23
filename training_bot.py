@@ -3,15 +3,28 @@
 Telegram бот для опросов о тренировках.
 Бот отправляет опросы за 4 дня до тренировки (пятница и воскресенье)
 и сохраняет результаты в Excel таблицу.
+
+После тренировки (через 2 часа) бот рассылает запросы на оценку
+тренировки (1-10) и сбор фидбэка участникам.
+Статистика оценок и текстовые отзывы сохраняются в feedback.xlsx.
+
+Также поддерживается создание ручных опросов через команду /create_poll
+с указанием даты, времени и места. После таких опросов также автоматически
+отправляются запросы на оценку через 2 часа после начала тренировки.
 """
 
 import logging
 import asyncio
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 from telegram import Update
-from telegram.ext import Application, CommandHandler, PollAnswerHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, PollAnswerHandler, ContextTypes, MessageHandler, filters, ConversationHandler
+
+# Загрузка переменных окружения из .env файла
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(
@@ -21,19 +34,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # КОНФИГУРАЦИЯ
-# Замените на ваш токен бота от @BotFather
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-# ID группы, куда добавлять бота (можно найти через @userinfobot или добавив бота в группу)
-GROUP_ID = "YOUR_GROUP_ID_HERE"
-# ID ветки (forum topic) для опросов в группе
-THREAD_ID = None  # Укажите ID темы "опросы", если группа имеет формат форума
-# Путь к файлу Excel для хранения статистики
-EXCEL_FILE = "attendance.xlsx"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROUP_ID = os.getenv("GROUP_ID")
+THREAD_ID = os.getenv("THREAD_ID")
+if THREAD_ID:
+    THREAD_ID = int(THREAD_ID)
+ATTENDANCE_FILE = os.getenv("ATTENDANCE_FILE", "attendance.xlsx")
+FEEDBACK_FILE = os.getenv("FEEDBACK_FILE", "feedback.xlsx")
 
 
 # Глобальное хранилище для связи ID опроса с данными тренировки
 # Формат: { poll_id: {"date": "DD.MM", "time": "HH:MM", "location": "LOC"} }
 active_polls = {}
+
+# Хранилище для пользователей, записавшихся на тренировку
+# Формат: { "DD.MM_HH:MM": {user_id: username} }
+training_attendees = {}
+
+# Хранилище для отправленных запросов на фидбэк (чтобы не дублировать)
+# Формат: { "DD.MM_HH:MM": True }
+feedback_requests_sent = set()
+
+# Хранилище для ручных опросов
+# Формат: { "DD.MM_HH:MM_LOC": {"poll_id": "...", "date": "DD.MM", "time": "HH:MM", "location": "LOC", "datetime": datetime} }
+manual_polls = {}
+
+# Состояния для диалога создания опроса
+CREATE_POLL_DATE, CREATE_POLL_TIME, CREATE_POLL_LOCATION = range(3)
 
 
 def get_next_friday():
@@ -56,7 +83,7 @@ def get_next_sunday():
 
 def init_excel_file():
     """Инициализирует Excel файл с заголовками."""
-    excel_path = Path(EXCEL_FILE)
+    excel_path = Path(ATTENDANCE_FILE)
     
     if not excel_path.exists():
         wb = Workbook()
@@ -67,15 +94,15 @@ def init_excel_file():
         ws.cell(row=1, column=1, value="Имя")
         ws.cell(row=1, column=2, value="Посещаемость (%)")
         
-        wb.save(EXCEL_FILE)
-        logger.info(f"Создан новый файл {EXCEL_FILE}")
+        wb.save(ATTENDANCE_FILE)
+        logger.info(f"Создан новый файл {ATTENDANCE_FILE}")
     
     return excel_path.exists()
 
 
 def add_user_if_not_exists(user_id: str, username: str):
     """Добавляет пользователя в таблицу, если его там нет."""
-    wb = load_workbook(EXCEL_FILE)
+    wb = load_workbook(ATTENDANCE_FILE)
     ws = wb.active
     
     # Проверяем, есть ли уже пользователь
@@ -89,14 +116,14 @@ def add_user_if_not_exists(user_id: str, username: str):
     ws.cell(row=new_row, column=1, value=user_id)
     ws.cell(row=new_row, column=2, value=0)
     
-    wb.save(EXCEL_FILE)
+    wb.save(ATTENDANCE_FILE)
     wb.close()
     logger.info(f"Добавлен пользователь: {username} ({user_id})")
 
 
 def add_training_date_column(training_date: str):
     """Добавляет колонку для даты тренировки, если её нет."""
-    wb = load_workbook(EXCEL_FILE)
+    wb = load_workbook(ATTENDANCE_FILE)
     ws = wb.active
     
     # Ищем колонку с этой датой
@@ -113,7 +140,7 @@ def add_training_date_column(training_date: str):
     for row in range(2, ws.max_row + 1):
         ws.cell(row=row, column=new_col, value=0)
     
-    wb.save(EXCEL_FILE)
+    wb.save(ATTENDANCE_FILE)
     wb.close()
     logger.info(f"Добавлена колонка для даты: {training_date}")
     return new_col
@@ -124,7 +151,7 @@ def record_vote(user_id: str, username: str, training_date: str, vote_value: int
     add_user_if_not_exists(user_id, username)
     date_col = add_training_date_column(training_date)
     
-    wb = load_workbook(EXCEL_FILE)
+    wb = load_workbook(ATTENDANCE_FILE)
     ws = wb.active
     
     # Находим строку пользователя
@@ -151,7 +178,7 @@ def record_vote(user_id: str, username: str, training_date: str, vote_value: int
         attendance_percent = round((attended_trainings / total_trainings * 100), 1) if total_trainings > 0 else 0
         ws.cell(row=user_row, column=2, value=attendance_percent)
         
-        wb.save(EXCEL_FILE)
+        wb.save(ATTENDANCE_FILE)
         logger.info(f"Записан голос пользователя {username}: {vote_value} на {training_date}")
     
     wb.close()
@@ -218,14 +245,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - Начать работу с ботом\n"
         "/help - Показать эту справку\n"
         "/status - Показать текущую статистику посещаемости\n"
-        "/test_poll - Тестовый опрос (только для администраторов)"
+        "/test_poll - Тестовый опрос (только для администраторов)\n"
+        "/create_poll - Создать ручной опрос с заданной датой, временем и местом (только для администраторов)"
     )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /status - показывает статистику."""
     try:
-        wb = load_workbook(EXCEL_FILE)
+        wb = load_workbook(ATTENDANCE_FILE)
         ws = wb.active
         
         if ws.max_row < 2:
@@ -300,6 +328,158 @@ async def test_poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Тестовый опрос отправлен!")
 
 
+async def create_poll_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало создания ручного опроса."""
+    # Проверка прав администратора
+    chat_member = await context.bot.get_chat_member(
+        chat_id=update.effective_chat.id,
+        user_id=update.effective_user.id
+    )
+    
+    if chat_member.status not in ['administrator', 'creator']:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "📅 Создание нового опроса\n\n"
+        "Введите дату тренировки в формате ДД.ММ (например, 25.12):"
+    )
+    return CREATE_POLL_DATE
+
+
+async def create_poll_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка даты тренировки."""
+    date_text = update.message.text.strip()
+    
+    # Проверяем формат даты
+    try:
+        datetime.strptime(date_text, '%d.%m')
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат даты. Используйте формат ДД.ММ (например, 25.12)\n\n"
+            "Введите дату тренировки:"
+        )
+        return CREATE_POLL_DATE
+    
+    context.user_data['poll_date'] = date_text
+    await update.message.reply_text(
+        f"✅ Дата: {date_text}\n\n"
+        "Теперь введите время тренировки в формате ЧЧ:ММ (например, 18:00):"
+    )
+    return CREATE_POLL_TIME
+
+
+async def create_poll_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка времени тренировки."""
+    time_text = update.message.text.strip()
+    
+    # Проверяем формат времени
+    try:
+        datetime.strptime(time_text, '%H:%M')
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат времени. Используйте формат ЧЧ:ММ (например, 18:00)\n\n"
+            "Введите время тренировки:"
+        )
+        return CREATE_POLL_TIME
+    
+    context.user_data['poll_time'] = time_text
+    await update.message.reply_text(
+        f"✅ Время: {time_text}\n\n"
+        "Теперь введите место проведения тренировки (например, БНТУ, РГУОР):"
+    )
+    return CREATE_POLL_LOCATION
+
+
+async def create_poll_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка места тренировки и создание опроса."""
+    location = update.message.text.strip()
+    
+    poll_date = context.user_data['poll_date']
+    poll_time = context.user_data['poll_time']
+    
+    # Создаём заголовок опроса
+    title = f"Тренировка {poll_date} {poll_time} {location}"
+    
+    # Отправляем опрос
+    poll_id = await send_poll(context.application, title, poll_date, poll_time, location)
+    
+    if poll_id:
+        # Сохраняем информацию о ручном опросе
+        training_key = f"{poll_date}_{poll_time}_{location}"
+        manual_polls[training_key] = {
+            "poll_id": poll_id,
+            "date": poll_date,
+            "time": poll_time,
+            "location": location
+        }
+        
+        # Вычисляем время отправки фидбэка (через 2 часа)
+        now = datetime.now()
+        try:
+            training_datetime = datetime.strptime(f"{now.year}.{poll_date} {poll_time}", '%Y.%d.%m %H:%M')
+        except ValueError:
+            # Если дата уже прошла в этом году, берём следующий год
+            training_datetime = datetime.strptime(f"{now.year + 1}.{poll_date} {poll_time}", '%Y.%d.%m %H:%M')
+        
+        feedback_datetime = training_datetime + timedelta(hours=2)
+        
+        # Планируем задачу на отправку фидбэка
+        context.job_queue.run_once(
+            callback=lambda ctx: send_manual_poll_feedback(ctx, poll_date, poll_time),
+            when=feedback_datetime,
+            name=f"feedback_{training_key}"
+        )
+        
+        await update.message.reply_text(
+            f"✅ Опрос создан!\n\n"
+            f"📅 Дата: {poll_date}\n"
+            f"⏰ Время: {poll_time}\n"
+            f"📍 Место: {location}\n\n"
+            f"Запросы на оценку будут отправлены участникам в {feedback_datetime.strftime('%d.%m %H:%M')}"
+        )
+    else:
+        await update.message.reply_text("❌ Не удалось создать опрос. Попробуйте ещё раз.")
+    
+    # Очищаем данные пользователя
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def send_manual_poll_feedback(context: ContextTypes.DEFAULT_TYPE, poll_date: str, poll_time: str):
+    """Отправляет запросы на фидбэк для ручного опроса."""
+    training_key = f"{poll_date}_{poll_time}"
+    
+    # Проверяем, не отправляли ли уже фидбэк для этой тренировки
+    if training_key in feedback_requests_sent:
+        return
+    
+    # Проверяем, есть ли пользователи на этой тренировке
+    if training_key not in training_attendees or not training_attendees[training_key]:
+        logger.info(f"Нет участников для тренировки {training_key}")
+        return
+    
+    attendees = training_attendees[training_key]
+    logger.info(f"Отправка фидбэка для ручной тренировки {training_key}, участников: {len(attendees)}")
+    
+    for user_id, username in attendees.items():
+        try:
+            # Отправляем сообщение с просьбой оценить тренировку
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"Привет, {username}! 👋\n\n"
+                     f"Тренировка закончилась. Пожалуйста, оцени её качество от 1 до 10.\n\n"
+                     f"Просто напиши число (например: 7)"
+            )
+            logger.info(f"Запрос на оценку отправлен пользователю {username} ({user_id})")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке запроса на оценку пользователю {user_id}: {e}")
+    
+    # Помечаем, что фидбэк для этой тренировки отправлен
+    feedback_requests_sent.add(training_key)
+    logger.info(f"Фидбэк для тренировки {training_key} отмечен как отправленный")
+
+
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ответов на опросы."""
     poll_answer = update.poll_answer
@@ -347,6 +527,14 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Записываем в таблицу
         record_vote(str(user_id), username, date_str, vote_value)
         
+        # Если пользователь идёт на тренировку, добавляем его в список attendees
+        if vote_value == 1 and training_data:
+            training_key = f"{date_str}_{time_str}"
+            if training_key not in training_attendees:
+                training_attendees[training_key] = {}
+            training_attendees[training_key][str(user_id)] = username
+            logger.info(f"Пользователь {username} записан на тренировку {training_key}")
+        
         logger.info(f"✅ Голос успешно записан: {username} -> {'иду' if vote_value == 1 else 'не идёт'} на {date_str}")
         
     except Exception as e:
@@ -371,13 +559,223 @@ async def scheduled_task(context: ContextTypes.DEFAULT_TYPE):
         await send_sunday_poll(context.application)
 
 
+async def send_feedback_request(context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет запросы на фидбэк пользователям, которые были на тренировке."""
+    now = datetime.now()
+    current_hour = now.hour
+    
+    # Проверяем время для отправки фидбэка
+    # Для тренировки в 18:00 - отправляем в 20:00
+    # Для тренировки в 10:00 - отправляем в 12:00
+    feedback_hours = {
+        "18:00": 20,  # Пятница: тренировка в 18:00, фидбэк в 20:00
+        "10:00": 12,  # Воскресенье: тренировка в 10:00, фидбэк в 12:00
+    }
+    
+    # Определяем, для какого времени тренировки сейчас нужно отправить фидбэк
+    target_time_str = None
+    if current_hour == 20:
+        target_time_str = "18:00"
+    elif current_hour == 12:
+        target_time_str = "10:00"
+    
+    if not target_time_str:
+        return
+    
+    # Определяем дату тренировки (сегодня)
+    training_date = now.strftime('%d.%m')
+    training_key = f"{training_date}_{target_time_str}"
+    
+    # Проверяем, не отправляли ли уже фидбэк для этой тренировки
+    if training_key in feedback_requests_sent:
+        return
+    
+    # Проверяем, есть ли пользователи на этой тренировке
+    if training_key not in training_attendees or not training_attendees[training_key]:
+        return
+    
+    attendees = training_attendees[training_key]
+    logger.info(f"Отправка фидбэка для тренировки {training_key}, участников: {len(attendees)}")
+    
+    for user_id, username in attendees.items():
+        try:
+            # Отправляем сообщение с просьбой оценить тренировку
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"Привет, {username}! 👋\n\n"
+                     f"Тренировка закончилась. Пожалуйста, оцени её качество от 1 до 10.\n\n"
+                     f"Просто напиши число (например: 7)"
+            )
+            logger.info(f"Запрос на оценку отправлен пользователю {username} ({user_id})")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке запроса на оценку пользователю {user_id}: {e}")
+    
+    # Помечаем, что фидбэк для этой тренировки отправлен
+    feedback_requests_sent.add(training_key)
+    logger.info(f"Фидбэк для тренировки {training_key} отмечен как отправленный")
+
+
+async def handle_feedback_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Универсальный обработчик оценок и текстового фидбэка от пользователей."""
+    try:
+        user_id = str(update.effective_user.id)
+        message_text = update.message.text.strip()
+        
+        # Проверяем, не находится ли пользователь в процессе создания опроса
+        # Если да - игнорируем сообщение (оно обрабатывается ConversationHandler)
+        if context.user_data.get('poll_date') is not None:
+            logger.debug(f"Игнорируем сообщение от {user_id}, так как пользователь в диалоге создания опроса")
+            return
+        
+        # Проверяем, является ли сообщение числом от 1 до 10 (оценка)
+        try:
+            rating = int(message_text)
+            if 1 <= rating <= 10:
+                # Это оценка - сохраняем её
+                save_feedback_rating(user_id, rating)
+                
+                # Отправляем подтверждение и просим написать фидбэк
+                await update.message.reply_text(
+                    f"Спасибо за оценку: {rating}/10! ⭐\n\n"
+                    f"Если хочешь, можешь написать краткий отзыв о тренировке:\n"
+                    f"что понравилось, что можно улучшить и т.д.\n\n"
+                    f"(Если не хочешь писать отзыв, просто проигнорируй это сообщение)"
+                )
+                logger.info(f"Получена оценка {rating} от пользователя {user_id}")
+                return
+        except ValueError:
+            pass  # Не число, продолжаем обработку как текст
+        
+        # Если дошли сюда - это текстовый фидбэк
+        # Сохраняем текстовый фидбэк
+        save_feedback_text(user_id, message_text)
+        
+        # Отправляем подтверждение
+        await update.message.reply_text(
+            "Спасибо за твой отзыв! 🙏\n"
+            "Он поможет сделать тренировки лучше."
+        )
+        logger.info(f"Получен текстовый фидбэк от пользователя {user_id}: {message_text[:50]}...")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке сообщения фидбэка: {e}")
+
+
+async def handle_feedback_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик оценок тренировок от пользователей (устарел, используется handle_feedback_message)."""
+    pass
+
+
+async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстового фидбэка от пользователей (устарел, используется handle_feedback_message)."""
+    pass
+
+
+def init_feedback_excel():
+    """Инициализирует Excel файл для хранения фидбэка."""
+    excel_path = Path(FEEDBACK_FILE)
+    
+    if not excel_path.exists():
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Фидбэк"
+        
+        # Заголовки
+        ws.cell(row=1, column=1, value="Дата")
+        ws.cell(row=1, column=2, value="Время")
+        ws.cell(row=1, column=3, value="User ID")
+        ws.cell(row=1, column=4, value="Имя")
+        ws.cell(row=1, column=5, value="Оценка")
+        ws.cell(row=1, column=6, value="Фидбэк")
+        
+        wb.save(FEEDBACK_FILE)
+        logger.info(f"Создан новый файл {FEEDBACK_FILE}")
+    
+    return excel_path.exists()
+
+
+def save_feedback_rating(user_id: str, rating: int):
+    """Сохраняет оценку тренировки в Excel."""
+    from openpyxl import load_workbook
+    
+    now = datetime.now()
+    training_date = now.strftime('%d.%m')
+    training_time = now.strftime('%H:%M')
+    
+    wb = load_workbook(FEEDBACK_FILE)
+    ws = wb.active
+    
+    # Получаем имя пользователя
+    # (в реальном боте можно получить из контекста, здесь упрощённо)
+    username = f"User_{user_id}"
+    
+    # Добавляем новую строку
+    new_row = ws.max_row + 1
+    ws.cell(row=new_row, column=1, value=training_date)
+    ws.cell(row=new_row, column=2, value=training_time)
+    ws.cell(row=new_row, column=3, value=user_id)
+    ws.cell(row=new_row, column=4, value=username)
+    ws.cell(row=new_row, column=5, value=rating)
+    ws.cell(row=new_row, column=6, value="")
+    
+    wb.save(FEEDBACK_FILE)
+    wb.close()
+    logger.info(f"Сохранена оценка {rating} от пользователя {user_id}")
+
+
+def save_feedback_text(user_id: str, feedback_text: str):
+    """Сохраняет текстовый фидбэк в Excel."""
+    from openpyxl import load_workbook
+    
+    now = datetime.now()
+    training_date = now.strftime('%d.%m')
+    training_time = now.strftime('%H:%M')
+    
+    wb = load_workbook(FEEDBACK_FILE)
+    ws = wb.active
+    
+    # Получаем имя пользователя
+    username = f"User_{user_id}"
+    
+    # Ищем последнюю запись для этого пользователя за сегодня
+    last_row_with_rating = None
+    for row in range(ws.max_row, 1, -1):
+        if (ws.cell(row=row, column=3).value == user_id and
+            ws.cell(row=row, column=1).value == training_date):
+            # Проверяем, есть ли уже оценка
+            if ws.cell(row=row, column=5).value is not None:
+                last_row_with_rating = row
+                break
+    
+    if last_row_with_rating:
+        # Обновляем существующую запись
+        ws.cell(row=last_row_with_rating, column=6, value=feedback_text)
+    else:
+        # Добавляем новую запись (только текст, без оценки)
+        new_row = ws.max_row + 1
+        ws.cell(row=new_row, column=1, value=training_date)
+        ws.cell(row=new_row, column=2, value=training_time)
+        ws.cell(row=new_row, column=3, value=user_id)
+        ws.cell(row=new_row, column=4, value=username)
+        ws.cell(row=new_row, column=5, value="")
+        ws.cell(row=new_row, column=6, value=feedback_text)
+    
+    wb.save(FEEDBACK_FILE)
+    wb.close()
+    logger.info(f"Сохранён фидбэк от пользователя {user_id}: {feedback_text[:30]}...")
+
+
 async def post_init(application):
     """Инициализация после запуска бота."""
     logger.info("Бот успешно запущен!")
-    logger.info(f"Excel файл: {EXCEL_FILE}")
+    logger.info(f"Excel файл: {ATTENDANCE_FILE}")
     logger.info(f"Группа: {GROUP_ID}")
     if THREAD_ID:
         logger.info(f"Ветка (topic): {THREAD_ID}")
+    
+    # Инициализация файла для фидбэка
+    init_feedback_excel()
+    logger.info(f"Файл {FEEDBACK_FILE} инициализирован")
 
 
 def main():
@@ -393,14 +791,41 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("test_poll", test_poll_command))
+    application.add_handler(CommandHandler("create_poll", create_poll_start))
+    
+    # Обработчик диалога создания опроса
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("create_poll", create_poll_start)],
+        states={
+            CREATE_POLL_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_poll_date)],
+            CREATE_POLL_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_poll_time)],
+            CREATE_POLL_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_poll_location)],
+        },
+        fallbacks=[],
+    )
+    application.add_handler(conv_handler)
     
     # Обработчик ответов на опросы
     application.add_handler(PollAnswerHandler(handle_poll_answer))
     
-    # Добавляем ежедневную задачу в 10:00
+    # Обработчики текстовых сообщений для фидбэка
+    # Универсальный обработчик для оценок и текстового фидбэка
+    # Важно: должен быть после ConversationHandler, чтобы не перехватывать сообщения во время диалога
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feedback_message))
+    
+    # Добавляем ежедневную задачу в 10:00 для отправки опросов
     job_queue = application.job_queue
     job_queue.run_daily(scheduled_task, time=datetime.strptime("10:00", "%H:%M").time())
-    logger.info("Запланирована ежедневная задача на 10:00")
+    logger.info("Запланирована ежедневная задача на 10:00 (опросы)")
+    
+    # Добавляем задачи для отправки фидбэка
+    # В 12:00 - для воскресной тренировки (10:00)
+    job_queue.run_daily(send_feedback_request, time=datetime.strptime("12:00", "%H:%M").time())
+    logger.info("Запланирована ежедневная задача на 12:00 (фидбэк для тренировки 10:00)")
+    
+    # В 20:00 - для пятничной тренировки (18:00)
+    job_queue.run_daily(send_feedback_request, time=datetime.strptime("20:00", "%H:%M").time())
+    logger.info("Запланирована ежедневная задача на 20:00 (фидбэк для тренировки 18:00)")
     
     # Запуск бота
     logger.info("Бот запущен и ожидает команды...")
