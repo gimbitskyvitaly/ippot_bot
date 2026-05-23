@@ -1,0 +1,19 @@
+[project]
+name = "training-bot"
+version = "0.1.0"
+description = "Telegram бот для опросов о тренировках"
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "python-telegram-bot[job-queue]>=22.7",
+]
+
+[project.scripts]
+training-bot = "training_bot:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
