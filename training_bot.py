@@ -7,6 +7,10 @@ Telegram бот для опросов о тренировках.
 После тренировки (через 2 часа) бот рассылает запросы на оценку
 тренировки (1-10) и сбор фидбэка участникам.
 Статистика оценок и текстовые отзывы сохраняются в feedback.xlsx.
+
+Также поддерживается создание ручных опросов через команду /create_poll
+с указанием даты, времени и места. После таких опросов также автоматически
+отправляются запросы на оценку через 2 часа после начала тренировки.
 """
 
 import logging
@@ -15,7 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from telegram import Update
-from telegram.ext import Application, CommandHandler, PollAnswerHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, PollAnswerHandler, ContextTypes, MessageHandler, filters, ConversationHandler
 
 # Настройка логирования
 logging.basicConfig(
@@ -46,6 +50,13 @@ training_attendees = {}
 # Хранилище для отправленных запросов на фидбэк (чтобы не дублировать)
 # Формат: { "DD.MM_HH:MM": True }
 feedback_requests_sent = set()
+
+# Хранилище для ручных опросов
+# Формат: { "DD.MM_HH:MM_LOC": {"poll_id": "...", "date": "DD.MM", "time": "HH:MM", "location": "LOC", "datetime": datetime} }
+manual_polls = {}
+
+# Состояния для диалога создания опроса
+CREATE_POLL_DATE, CREATE_POLL_TIME, CREATE_POLL_LOCATION = range(3)
 
 
 def get_next_friday():
@@ -230,7 +241,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - Начать работу с ботом\n"
         "/help - Показать эту справку\n"
         "/status - Показать текущую статистику посещаемости\n"
-        "/test_poll - Тестовый опрос (только для администраторов)"
+        "/test_poll - Тестовый опрос (только для администраторов)\n"
+        "/create_poll - Создать ручной опрос с заданной датой, временем и местом (только для администраторов)"
     )
 
 
@@ -310,6 +322,158 @@ async def test_poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await send_poll(context.application, title, test_date, "18:00", "БНТУ")
     await update.message.reply_text("Тестовый опрос отправлен!")
+
+
+async def create_poll_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало создания ручного опроса."""
+    # Проверка прав администратора
+    chat_member = await context.bot.get_chat_member(
+        chat_id=update.effective_chat.id,
+        user_id=update.effective_user.id
+    )
+    
+    if chat_member.status not in ['administrator', 'creator']:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "📅 Создание нового опроса\n\n"
+        "Введите дату тренировки в формате ДД.ММ (например, 25.12):"
+    )
+    return CREATE_POLL_DATE
+
+
+async def create_poll_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка даты тренировки."""
+    date_text = update.message.text.strip()
+    
+    # Проверяем формат даты
+    try:
+        datetime.strptime(date_text, '%d.%m')
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат даты. Используйте формат ДД.ММ (например, 25.12)\n\n"
+            "Введите дату тренировки:"
+        )
+        return CREATE_POLL_DATE
+    
+    context.user_data['poll_date'] = date_text
+    await update.message.reply_text(
+        f"✅ Дата: {date_text}\n\n"
+        "Теперь введите время тренировки в формате ЧЧ:ММ (например, 18:00):"
+    )
+    return CREATE_POLL_TIME
+
+
+async def create_poll_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка времени тренировки."""
+    time_text = update.message.text.strip()
+    
+    # Проверяем формат времени
+    try:
+        datetime.strptime(time_text, '%H:%M')
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат времени. Используйте формат ЧЧ:ММ (например, 18:00)\n\n"
+            "Введите время тренировки:"
+        )
+        return CREATE_POLL_TIME
+    
+    context.user_data['poll_time'] = time_text
+    await update.message.reply_text(
+        f"✅ Время: {time_text}\n\n"
+        "Теперь введите место проведения тренировки (например, БНТУ, РГУОР):"
+    )
+    return CREATE_POLL_LOCATION
+
+
+async def create_poll_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка места тренировки и создание опроса."""
+    location = update.message.text.strip()
+    
+    poll_date = context.user_data['poll_date']
+    poll_time = context.user_data['poll_time']
+    
+    # Создаём заголовок опроса
+    title = f"Тренировка {poll_date} {poll_time} {location}"
+    
+    # Отправляем опрос
+    poll_id = await send_poll(context.application, title, poll_date, poll_time, location)
+    
+    if poll_id:
+        # Сохраняем информацию о ручном опросе
+        training_key = f"{poll_date}_{poll_time}_{location}"
+        manual_polls[training_key] = {
+            "poll_id": poll_id,
+            "date": poll_date,
+            "time": poll_time,
+            "location": location
+        }
+        
+        # Вычисляем время отправки фидбэка (через 2 часа)
+        now = datetime.now()
+        try:
+            training_datetime = datetime.strptime(f"{now.year}.{poll_date} {poll_time}", '%Y.%d.%m %H:%M')
+        except ValueError:
+            # Если дата уже прошла в этом году, берём следующий год
+            training_datetime = datetime.strptime(f"{now.year + 1}.{poll_date} {poll_time}", '%Y.%d.%m %H:%M')
+        
+        feedback_datetime = training_datetime + timedelta(hours=2)
+        
+        # Планируем задачу на отправку фидбэка
+        context.job_queue.run_once(
+            callback=lambda ctx: send_manual_poll_feedback(ctx, poll_date, poll_time),
+            when=feedback_datetime,
+            name=f"feedback_{training_key}"
+        )
+        
+        await update.message.reply_text(
+            f"✅ Опрос создан!\n\n"
+            f"📅 Дата: {poll_date}\n"
+            f"⏰ Время: {poll_time}\n"
+            f"📍 Место: {location}\n\n"
+            f"Запросы на оценку будут отправлены участникам в {feedback_datetime.strftime('%d.%m %H:%M')}"
+        )
+    else:
+        await update.message.reply_text("❌ Не удалось создать опрос. Попробуйте ещё раз.")
+    
+    # Очищаем данные пользователя
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def send_manual_poll_feedback(context: ContextTypes.DEFAULT_TYPE, poll_date: str, poll_time: str):
+    """Отправляет запросы на фидбэк для ручного опроса."""
+    training_key = f"{poll_date}_{poll_time}"
+    
+    # Проверяем, не отправляли ли уже фидбэк для этой тренировки
+    if training_key in feedback_requests_sent:
+        return
+    
+    # Проверяем, есть ли пользователи на этой тренировке
+    if training_key not in training_attendees or not training_attendees[training_key]:
+        logger.info(f"Нет участников для тренировки {training_key}")
+        return
+    
+    attendees = training_attendees[training_key]
+    logger.info(f"Отправка фидбэка для ручной тренировки {training_key}, участников: {len(attendees)}")
+    
+    for user_id, username in attendees.items():
+        try:
+            # Отправляем сообщение с просьбой оценить тренировку
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"Привет, {username}! 👋\n\n"
+                     f"Тренировка закончилась. Пожалуйста, оцени её качество от 1 до 10.\n\n"
+                     f"Просто напиши число (например: 7)"
+            )
+            logger.info(f"Запрос на оценку отправлен пользователю {username} ({user_id})")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке запроса на оценку пользователю {user_id}: {e}")
+    
+    # Помечаем, что фидбэк для этой тренировки отправлен
+    feedback_requests_sent.add(training_key)
+    logger.info(f"Фидбэк для тренировки {training_key} отмечен как отправленный")
 
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -447,50 +611,32 @@ async def send_feedback_request(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Фидбэк для тренировки {training_key} отмечен как отправленный")
 
 
-async def handle_feedback_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик оценок тренировок от пользователей."""
+async def handle_feedback_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Универсальный обработчик оценок и текстового фидбэка от пользователей."""
     try:
         user_id = str(update.effective_user.id)
         message_text = update.message.text.strip()
         
-        # Проверяем, является ли сообщение числом от 1 до 10
-        try:
-            rating = int(message_text)
-            if rating < 1 or rating > 10:
-                return  # Не является валидной оценкой
-        except ValueError:
-            return  # Не число
-        
-        # Сохраняем оценку
-        save_feedback_rating(user_id, rating)
-        
-        # Отправляем подтверждение и просим написать фидбэк
-        await update.message.reply_text(
-            f"Спасибо за оценку: {rating}/10! ⭐\n\n"
-            f"Если хочешь, можешь написать краткий отзыв о тренировке:\n"
-            f"что понравилось, что можно улучшить и т.д.\n\n"
-            f"(Если не хочешь писать отзыв, просто проигнорируй это сообщение)"
-        )
-        logger.info(f"Получена оценка {rating} от пользователя {user_id}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка при обработке оценки: {e}")
-
-
-async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстового фидбэка от пользователей."""
-    try:
-        user_id = str(update.effective_user.id)
-        message_text = update.message.text.strip()
-        
-        # Проверяем, не является ли это числом (оценкой)
+        # Проверяем, является ли сообщение числом от 1 до 10 (оценка)
         try:
             rating = int(message_text)
             if 1 <= rating <= 10:
-                return  # Это оценка, а не текст фидбэка
+                # Это оценка - сохраняем её
+                save_feedback_rating(user_id, rating)
+                
+                # Отправляем подтверждение и просим написать фидбэк
+                await update.message.reply_text(
+                    f"Спасибо за оценку: {rating}/10! ⭐\n\n"
+                    f"Если хочешь, можешь написать краткий отзыв о тренировке:\n"
+                    f"что понравилось, что можно улучшить и т.д.\n\n"
+                    f"(Если не хочешь писать отзыв, просто проигнорируй это сообщение)"
+                )
+                logger.info(f"Получена оценка {rating} от пользователя {user_id}")
+                return
         except ValueError:
-            pass  # Это текст
+            pass  # Не число, продолжаем обработку как текст
         
+        # Если дошли сюда - это текстовый фидбэк
         # Сохраняем текстовый фидбэк
         save_feedback_text(user_id, message_text)
         
@@ -502,7 +648,17 @@ async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.info(f"Получен текстовый фидбэк от пользователя {user_id}: {message_text[:50]}...")
         
     except Exception as e:
-        logger.error(f"Ошибка при обработке текстового фидбэка: {e}")
+        logger.error(f"Ошибка при обработке сообщения фидбэка: {e}")
+
+
+async def handle_feedback_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик оценок тренировок от пользователей (устарел, используется handle_feedback_message)."""
+    pass
+
+
+async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстового фидбэка от пользователей (устарел, используется handle_feedback_message)."""
+    pass
 
 
 def init_feedback_excel():
@@ -625,12 +781,26 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("test_poll", test_poll_command))
+    application.add_handler(CommandHandler("create_poll", create_poll_start))
+    
+    # Обработчик диалога создания опроса
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("create_poll", create_poll_start)],
+        states={
+            CREATE_POLL_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_poll_date)],
+            CREATE_POLL_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_poll_time)],
+            CREATE_POLL_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_poll_location)],
+        },
+        fallbacks=[],
+    )
+    application.add_handler(conv_handler)
     
     # Обработчик ответов на опросы
     application.add_handler(PollAnswerHandler(handle_poll_answer))
     
     # Обработчики текстовых сообщений для фидбэка
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feedback_text))
+    # Универсальный обработчик для оценок и текстового фидбэка
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feedback_message))
     
     # Добавляем ежедневную задачу в 10:00 для отправки опросов
     job_queue = application.job_queue
