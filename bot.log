@@ -1,0 +1,98 @@
+2026-05-23 16:50:50,750 - apscheduler.scheduler - INFO - Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2026-05-23 16:50:50,750 - training_bot - INFO - Запланирована ежедневная задача на 10:00
+2026-05-23 16:50:50,750 - training_bot - INFO - Бот запущен и ожидает команды...
+2026-05-23 16:50:51,257 - httpx - INFO - HTTP Request: POST https://api.telegram.org/botYOUR_BOT_TOKEN_HERE/getMe "HTTP/1.1 404 Not Found"
+2026-05-23 16:50:51,258 - telegram.ext - ERROR - Network Retry Loop (Bootstrap Initialize Application): Invalid token. Aborting retry loop.
+Traceback (most recent call last):
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/_bot.py", line 857, in initialize
+    await self.get_me()
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_extbot.py", line 2008, in get_me
+    return await super().get_me(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/_bot.py", line 990, in get_me
+    result = await self._post(
+             ^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/_bot.py", line 704, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_extbot.py", line 370, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/_bot.py", line 733, in _do_post
+    result = await request.post(
+             ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/request/_baserequest.py", line 198, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/request/_baserequest.py", line 375, in _request_wrapper
+    raise exception
+telegram.error.InvalidToken: Not Found
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_utils/networkloop.py", line 161, in network_retry_loop
+    await do_action()
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_utils/networkloop.py", line 136, in do_action
+    await action_cb()
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_application.py", line 489, in initialize
+    await self.bot.initialize()
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_extbot.py", line 316, in initialize
+    await super().initialize()
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/_bot.py", line 860, in initialize
+    raise InvalidToken(f"The token `{self._token}` was rejected by the server.") from exc
+telegram.error.InvalidToken: The token `YOUR_BOT_TOKEN_HERE` was rejected by the server.
+Traceback (most recent call last):
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/_bot.py", line 857, in initialize
+    await self.get_me()
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_extbot.py", line 2008, in get_me
+    return await super().get_me(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/_bot.py", line 990, in get_me
+    result = await self._post(
+             ^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/_bot.py", line 704, in _post
+    return await self._do_post(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_extbot.py", line 370, in _do_post
+    return await super()._do_post(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/_bot.py", line 733, in _do_post
+    result = await request.post(
+             ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/request/_baserequest.py", line 198, in post
+    result = await self._request_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/request/_baserequest.py", line 375, in _request_wrapper
+    raise exception
+telegram.error.InvalidToken: Not Found
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/workspace/.venv/bin/training-bot", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/workspace/training_bot.py", line 389, in main
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_application.py", line 839, in run_polling
+    return self.__run(
+           ^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_application.py", line 1054, in __run
+    loop.run_until_complete(self._bootstrap_initialize(max_retries=bootstrap_retries))
+  File "/usr/local/lib/python3.12/asyncio/base_events.py", line 691, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_application.py", line 1014, in _bootstrap_initialize
+    await network_retry_loop(
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_utils/networkloop.py", line 161, in network_retry_loop
+    await do_action()
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_utils/networkloop.py", line 136, in do_action
+    await action_cb()
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_application.py", line 489, in initialize
+    await self.bot.initialize()
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/ext/_extbot.py", line 316, in initialize
+    await super().initialize()
+  File "/workspace/.venv/lib/python3.12/site-packages/telegram/_bot.py", line 860, in initialize
+    raise InvalidToken(f"The token `{self._token}` was rejected by the server.") from exc
+telegram.error.InvalidToken: The token `YOUR_BOT_TOKEN_HERE` was rejected by the server.

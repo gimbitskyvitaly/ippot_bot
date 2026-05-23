@@ -289,7 +289,9 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     poll_answer = update.poll_answer
     
     try:
-        logger.info(f"Получен ответ на опрос от пользователя {poll_answer.user_id}")
+        # В python-telegram-bot 20+ используем poll_answer.user.id вместо poll_answer.user_id
+        user_id = poll_answer.user.id
+        logger.info(f"Получен ответ на опрос от пользователя {user_id}")
         logger.info(f"ID опроса: {poll_answer.poll_id}")
         logger.info(f"Выбранные варианты: {poll_answer.option_ids}")
         
@@ -308,10 +310,10 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.warning(f"Не удалось извлечь дату из вопроса, используем текущую: {date_str}")
         
         # Получаем информацию о пользователе
-        user = await context.bot.get_chat(poll_answer.user_id)
-        username = user.first_name or user.username or str(poll_answer.user_id)
+        user = await context.bot.get_chat(user_id)
+        username = user.first_name or user.username or str(user_id)
         
-        logger.info(f"Пользователь: {username} ({poll_answer.user_id})")
+        logger.info(f"Пользователь: {username} ({user_id})")
         
         # Определяем значение голоса
         if not poll_answer.option_ids:
@@ -325,7 +327,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.info(f"Выбранный вариант: {option_index}, значение: {vote_value} ({'иду' if vote_value == 1 else 'не идёт'})")
         
         # Записываем в таблицу
-        record_vote(str(poll_answer.user_id), username, date_str, vote_value)
+        record_vote(str(user_id), username, date_str, vote_value)
         
         logger.info(f"✅ Голос успешно записан: {username} -> {'иду' if vote_value == 1 else 'не идёт'} на {date_str}")
         
