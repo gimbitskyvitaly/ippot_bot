@@ -15,11 +15,16 @@ Telegram бот для опросов о тренировках.
 
 import logging
 import asyncio
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 from telegram import Update
 from telegram.ext import Application, CommandHandler, PollAnswerHandler, ContextTypes, MessageHandler, filters, ConversationHandler
+
+# Загрузка переменных окружения из .env файла
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(
@@ -29,14 +34,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # КОНФИГУРАЦИЯ
-# Замените на ваш токен бота от @BotFather
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-# ID группы, куда добавлять бота (можно найти через @userinfobot или добавив бота в группу)
-GROUP_ID = "YOUR_GROUP_ID_HERE"
-# ID ветки (forum topic) для опросов в группе
-THREAD_ID = None  # Укажите ID темы "опросы", если группа имеет формат форума
-# Путь к файлу Excel для хранения статистики
-EXCEL_FILE = "attendance.xlsx"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROUP_ID = os.getenv("GROUP_ID")
+THREAD_ID = os.getenv("THREAD_ID")
+if THREAD_ID:
+    THREAD_ID = int(THREAD_ID)
+ATTENDANCE_FILE = os.getenv("ATTENDANCE_FILE", "attendance.xlsx")
+FEEDBACK_FILE = os.getenv("FEEDBACK_FILE", "feedback.xlsx")
 
 
 # Глобальное хранилище для связи ID опроса с данными тренировки
@@ -79,7 +83,7 @@ def get_next_sunday():
 
 def init_excel_file():
     """Инициализирует Excel файл с заголовками."""
-    excel_path = Path(EXCEL_FILE)
+    excel_path = Path(ATTENDANCE_FILE)
     
     if not excel_path.exists():
         wb = Workbook()
@@ -90,15 +94,15 @@ def init_excel_file():
         ws.cell(row=1, column=1, value="Имя")
         ws.cell(row=1, column=2, value="Посещаемость (%)")
         
-        wb.save(EXCEL_FILE)
-        logger.info(f"Создан новый файл {EXCEL_FILE}")
+        wb.save(ATTENDANCE_FILE)
+        logger.info(f"Создан новый файл {ATTENDANCE_FILE}")
     
     return excel_path.exists()
 
 
 def add_user_if_not_exists(user_id: str, username: str):
     """Добавляет пользователя в таблицу, если его там нет."""
-    wb = load_workbook(EXCEL_FILE)
+    wb = load_workbook(ATTENDANCE_FILE)
     ws = wb.active
     
     # Проверяем, есть ли уже пользователь
@@ -112,14 +116,14 @@ def add_user_if_not_exists(user_id: str, username: str):
     ws.cell(row=new_row, column=1, value=user_id)
     ws.cell(row=new_row, column=2, value=0)
     
-    wb.save(EXCEL_FILE)
+    wb.save(ATTENDANCE_FILE)
     wb.close()
     logger.info(f"Добавлен пользователь: {username} ({user_id})")
 
 
 def add_training_date_column(training_date: str):
     """Добавляет колонку для даты тренировки, если её нет."""
-    wb = load_workbook(EXCEL_FILE)
+    wb = load_workbook(ATTENDANCE_FILE)
     ws = wb.active
     
     # Ищем колонку с этой датой
@@ -136,7 +140,7 @@ def add_training_date_column(training_date: str):
     for row in range(2, ws.max_row + 1):
         ws.cell(row=row, column=new_col, value=0)
     
-    wb.save(EXCEL_FILE)
+    wb.save(ATTENDANCE_FILE)
     wb.close()
     logger.info(f"Добавлена колонка для даты: {training_date}")
     return new_col
@@ -147,7 +151,7 @@ def record_vote(user_id: str, username: str, training_date: str, vote_value: int
     add_user_if_not_exists(user_id, username)
     date_col = add_training_date_column(training_date)
     
-    wb = load_workbook(EXCEL_FILE)
+    wb = load_workbook(ATTENDANCE_FILE)
     ws = wb.active
     
     # Находим строку пользователя
@@ -174,7 +178,7 @@ def record_vote(user_id: str, username: str, training_date: str, vote_value: int
         attendance_percent = round((attended_trainings / total_trainings * 100), 1) if total_trainings > 0 else 0
         ws.cell(row=user_row, column=2, value=attendance_percent)
         
-        wb.save(EXCEL_FILE)
+        wb.save(ATTENDANCE_FILE)
         logger.info(f"Записан голос пользователя {username}: {vote_value} на {training_date}")
     
     wb.close()
@@ -249,7 +253,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /status - показывает статистику."""
     try:
-        wb = load_workbook(EXCEL_FILE)
+        wb = load_workbook(ATTENDANCE_FILE)
         ws = wb.active
         
         if ws.max_row < 2:
@@ -663,7 +667,7 @@ async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def init_feedback_excel():
     """Инициализирует Excel файл для хранения фидбэка."""
-    excel_path = Path("feedback.xlsx")
+    excel_path = Path(FEEDBACK_FILE)
     
     if not excel_path.exists():
         wb = Workbook()
@@ -678,8 +682,8 @@ def init_feedback_excel():
         ws.cell(row=1, column=5, value="Оценка")
         ws.cell(row=1, column=6, value="Фидбэк")
         
-        wb.save("feedback.xlsx")
-        logger.info("Создан новый файл feedback.xlsx")
+        wb.save(FEEDBACK_FILE)
+        logger.info(f"Создан новый файл {FEEDBACK_FILE}")
     
     return excel_path.exists()
 
@@ -692,7 +696,7 @@ def save_feedback_rating(user_id: str, rating: int):
     training_date = now.strftime('%d.%m')
     training_time = now.strftime('%H:%M')
     
-    wb = load_workbook("feedback.xlsx")
+    wb = load_workbook(FEEDBACK_FILE)
     ws = wb.active
     
     # Получаем имя пользователя
@@ -708,7 +712,7 @@ def save_feedback_rating(user_id: str, rating: int):
     ws.cell(row=new_row, column=5, value=rating)
     ws.cell(row=new_row, column=6, value="")
     
-    wb.save("feedback.xlsx")
+    wb.save(FEEDBACK_FILE)
     wb.close()
     logger.info(f"Сохранена оценка {rating} от пользователя {user_id}")
 
@@ -721,7 +725,7 @@ def save_feedback_text(user_id: str, feedback_text: str):
     training_date = now.strftime('%d.%m')
     training_time = now.strftime('%H:%M')
     
-    wb = load_workbook("feedback.xlsx")
+    wb = load_workbook(FEEDBACK_FILE)
     ws = wb.active
     
     # Получаем имя пользователя
@@ -750,7 +754,7 @@ def save_feedback_text(user_id: str, feedback_text: str):
         ws.cell(row=new_row, column=5, value="")
         ws.cell(row=new_row, column=6, value=feedback_text)
     
-    wb.save("feedback.xlsx")
+    wb.save(FEEDBACK_FILE)
     wb.close()
     logger.info(f"Сохранён фидбэк от пользователя {user_id}: {feedback_text[:30]}...")
 
@@ -758,14 +762,14 @@ def save_feedback_text(user_id: str, feedback_text: str):
 async def post_init(application):
     """Инициализация после запуска бота."""
     logger.info("Бот успешно запущен!")
-    logger.info(f"Excel файл: {EXCEL_FILE}")
+    logger.info(f"Excel файл: {ATTENDANCE_FILE}")
     logger.info(f"Группа: {GROUP_ID}")
     if THREAD_ID:
         logger.info(f"Ветка (topic): {THREAD_ID}")
     
     # Инициализация файла для фидбэка
     init_feedback_excel()
-    logger.info("Файл feedback.xlsx инициализирован")
+    logger.info(f"Файл {FEEDBACK_FILE} инициализирован")
 
 
 def main():
