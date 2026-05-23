@@ -3,6 +3,10 @@
 Telegram бот для опросов о тренировках.
 Бот отправляет опросы за 4 дня до тренировки (пятница и воскресенье)
 и сохраняет результаты в Excel таблицу.
+
+После тренировки (через 2 часа) бот рассылает запросы на оценку
+тренировки (1-10) и сбор фидбэка участникам.
+Статистика оценок и текстовые отзывы сохраняются в feedback.xlsx.
 """
 
 import logging
@@ -11,7 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from telegram import Update
-from telegram.ext import Application, CommandHandler, PollAnswerHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, PollAnswerHandler, ContextTypes, MessageHandler, filters
 
 # Настройка логирования
 logging.basicConfig(
@@ -34,6 +38,14 @@ EXCEL_FILE = "attendance.xlsx"
 # Глобальное хранилище для связи ID опроса с данными тренировки
 # Формат: { poll_id: {"date": "DD.MM", "time": "HH:MM", "location": "LOC"} }
 active_polls = {}
+
+# Хранилище для пользователей, записавшихся на тренировку
+# Формат: { "DD.MM_HH:MM": {user_id: username} }
+training_attendees = {}
+
+# Хранилище для отправленных запросов на фидбэк (чтобы не дублировать)
+# Формат: { "DD.MM_HH:MM": True }
+feedback_requests_sent = set()
 
 
 def get_next_friday():
@@ -347,6 +359,14 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Записываем в таблицу
         record_vote(str(user_id), username, date_str, vote_value)
         
+        # Если пользователь идёт на тренировку, добавляем его в список attendees
+        if vote_value == 1 and training_data:
+            training_key = f"{date_str}_{time_str}"
+            if training_key not in training_attendees:
+                training_attendees[training_key] = {}
+            training_attendees[training_key][str(user_id)] = username
+            logger.info(f"Пользователь {username} записан на тренировку {training_key}")
+        
         logger.info(f"✅ Голос успешно записан: {username} -> {'иду' if vote_value == 1 else 'не идёт'} на {date_str}")
         
     except Exception as e:
@@ -371,6 +391,214 @@ async def scheduled_task(context: ContextTypes.DEFAULT_TYPE):
         await send_sunday_poll(context.application)
 
 
+async def send_feedback_request(context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет запросы на фидбэк пользователям, которые были на тренировке."""
+    now = datetime.now()
+    current_hour = now.hour
+    
+    # Проверяем время для отправки фидбэка
+    # Для тренировки в 18:00 - отправляем в 20:00
+    # Для тренировки в 10:00 - отправляем в 12:00
+    feedback_hours = {
+        "18:00": 20,  # Пятница: тренировка в 18:00, фидбэк в 20:00
+        "10:00": 12,  # Воскресенье: тренировка в 10:00, фидбэк в 12:00
+    }
+    
+    # Определяем, для какого времени тренировки сейчас нужно отправить фидбэк
+    target_time_str = None
+    if current_hour == 20:
+        target_time_str = "18:00"
+    elif current_hour == 12:
+        target_time_str = "10:00"
+    
+    if not target_time_str:
+        return
+    
+    # Определяем дату тренировки (сегодня)
+    training_date = now.strftime('%d.%m')
+    training_key = f"{training_date}_{target_time_str}"
+    
+    # Проверяем, не отправляли ли уже фидбэк для этой тренировки
+    if training_key in feedback_requests_sent:
+        return
+    
+    # Проверяем, есть ли пользователи на этой тренировке
+    if training_key not in training_attendees or not training_attendees[training_key]:
+        return
+    
+    attendees = training_attendees[training_key]
+    logger.info(f"Отправка фидбэка для тренировки {training_key}, участников: {len(attendees)}")
+    
+    for user_id, username in attendees.items():
+        try:
+            # Отправляем сообщение с просьбой оценить тренировку
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"Привет, {username}! 👋\n\n"
+                     f"Тренировка закончилась. Пожалуйста, оцени её качество от 1 до 10.\n\n"
+                     f"Просто напиши число (например: 7)"
+            )
+            logger.info(f"Запрос на оценку отправлен пользователю {username} ({user_id})")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке запроса на оценку пользователю {user_id}: {e}")
+    
+    # Помечаем, что фидбэк для этой тренировки отправлен
+    feedback_requests_sent.add(training_key)
+    logger.info(f"Фидбэк для тренировки {training_key} отмечен как отправленный")
+
+
+async def handle_feedback_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик оценок тренировок от пользователей."""
+    try:
+        user_id = str(update.effective_user.id)
+        message_text = update.message.text.strip()
+        
+        # Проверяем, является ли сообщение числом от 1 до 10
+        try:
+            rating = int(message_text)
+            if rating < 1 or rating > 10:
+                return  # Не является валидной оценкой
+        except ValueError:
+            return  # Не число
+        
+        # Сохраняем оценку
+        save_feedback_rating(user_id, rating)
+        
+        # Отправляем подтверждение и просим написать фидбэк
+        await update.message.reply_text(
+            f"Спасибо за оценку: {rating}/10! ⭐\n\n"
+            f"Если хочешь, можешь написать краткий отзыв о тренировке:\n"
+            f"что понравилось, что можно улучшить и т.д.\n\n"
+            f"(Если не хочешь писать отзыв, просто проигнорируй это сообщение)"
+        )
+        logger.info(f"Получена оценка {rating} от пользователя {user_id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке оценки: {e}")
+
+
+async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстового фидбэка от пользователей."""
+    try:
+        user_id = str(update.effective_user.id)
+        message_text = update.message.text.strip()
+        
+        # Проверяем, не является ли это числом (оценкой)
+        try:
+            rating = int(message_text)
+            if 1 <= rating <= 10:
+                return  # Это оценка, а не текст фидбэка
+        except ValueError:
+            pass  # Это текст
+        
+        # Сохраняем текстовый фидбэк
+        save_feedback_text(user_id, message_text)
+        
+        # Отправляем подтверждение
+        await update.message.reply_text(
+            "Спасибо за твой отзыв! 🙏\n"
+            "Он поможет сделать тренировки лучше."
+        )
+        logger.info(f"Получен текстовый фидбэк от пользователя {user_id}: {message_text[:50]}...")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке текстового фидбэка: {e}")
+
+
+def init_feedback_excel():
+    """Инициализирует Excel файл для хранения фидбэка."""
+    excel_path = Path("feedback.xlsx")
+    
+    if not excel_path.exists():
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Фидбэк"
+        
+        # Заголовки
+        ws.cell(row=1, column=1, value="Дата")
+        ws.cell(row=1, column=2, value="Время")
+        ws.cell(row=1, column=3, value="User ID")
+        ws.cell(row=1, column=4, value="Имя")
+        ws.cell(row=1, column=5, value="Оценка")
+        ws.cell(row=1, column=6, value="Фидбэк")
+        
+        wb.save("feedback.xlsx")
+        logger.info("Создан новый файл feedback.xlsx")
+    
+    return excel_path.exists()
+
+
+def save_feedback_rating(user_id: str, rating: int):
+    """Сохраняет оценку тренировки в Excel."""
+    from openpyxl import load_workbook
+    
+    now = datetime.now()
+    training_date = now.strftime('%d.%m')
+    training_time = now.strftime('%H:%M')
+    
+    wb = load_workbook("feedback.xlsx")
+    ws = wb.active
+    
+    # Получаем имя пользователя
+    # (в реальном боте можно получить из контекста, здесь упрощённо)
+    username = f"User_{user_id}"
+    
+    # Добавляем новую строку
+    new_row = ws.max_row + 1
+    ws.cell(row=new_row, column=1, value=training_date)
+    ws.cell(row=new_row, column=2, value=training_time)
+    ws.cell(row=new_row, column=3, value=user_id)
+    ws.cell(row=new_row, column=4, value=username)
+    ws.cell(row=new_row, column=5, value=rating)
+    ws.cell(row=new_row, column=6, value="")
+    
+    wb.save("feedback.xlsx")
+    wb.close()
+    logger.info(f"Сохранена оценка {rating} от пользователя {user_id}")
+
+
+def save_feedback_text(user_id: str, feedback_text: str):
+    """Сохраняет текстовый фидбэк в Excel."""
+    from openpyxl import load_workbook
+    
+    now = datetime.now()
+    training_date = now.strftime('%d.%m')
+    training_time = now.strftime('%H:%M')
+    
+    wb = load_workbook("feedback.xlsx")
+    ws = wb.active
+    
+    # Получаем имя пользователя
+    username = f"User_{user_id}"
+    
+    # Ищем последнюю запись для этого пользователя за сегодня
+    last_row_with_rating = None
+    for row in range(ws.max_row, 1, -1):
+        if (ws.cell(row=row, column=3).value == user_id and
+            ws.cell(row=row, column=1).value == training_date):
+            # Проверяем, есть ли уже оценка
+            if ws.cell(row=row, column=5).value is not None:
+                last_row_with_rating = row
+                break
+    
+    if last_row_with_rating:
+        # Обновляем существующую запись
+        ws.cell(row=last_row_with_rating, column=6, value=feedback_text)
+    else:
+        # Добавляем новую запись (только текст, без оценки)
+        new_row = ws.max_row + 1
+        ws.cell(row=new_row, column=1, value=training_date)
+        ws.cell(row=new_row, column=2, value=training_time)
+        ws.cell(row=new_row, column=3, value=user_id)
+        ws.cell(row=new_row, column=4, value=username)
+        ws.cell(row=new_row, column=5, value="")
+        ws.cell(row=new_row, column=6, value=feedback_text)
+    
+    wb.save("feedback.xlsx")
+    wb.close()
+    logger.info(f"Сохранён фидбэк от пользователя {user_id}: {feedback_text[:30]}...")
+
+
 async def post_init(application):
     """Инициализация после запуска бота."""
     logger.info("Бот успешно запущен!")
@@ -378,6 +606,10 @@ async def post_init(application):
     logger.info(f"Группа: {GROUP_ID}")
     if THREAD_ID:
         logger.info(f"Ветка (topic): {THREAD_ID}")
+    
+    # Инициализация файла для фидбэка
+    init_feedback_excel()
+    logger.info("Файл feedback.xlsx инициализирован")
 
 
 def main():
@@ -397,10 +629,22 @@ def main():
     # Обработчик ответов на опросы
     application.add_handler(PollAnswerHandler(handle_poll_answer))
     
-    # Добавляем ежедневную задачу в 10:00
+    # Обработчики текстовых сообщений для фидбэка
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feedback_text))
+    
+    # Добавляем ежедневную задачу в 10:00 для отправки опросов
     job_queue = application.job_queue
     job_queue.run_daily(scheduled_task, time=datetime.strptime("10:00", "%H:%M").time())
-    logger.info("Запланирована ежедневная задача на 10:00")
+    logger.info("Запланирована ежедневная задача на 10:00 (опросы)")
+    
+    # Добавляем задачи для отправки фидбэка
+    # В 12:00 - для воскресной тренировки (10:00)
+    job_queue.run_daily(send_feedback_request, time=datetime.strptime("12:00", "%H:%M").time())
+    logger.info("Запланирована ежедневная задача на 12:00 (фидбэк для тренировки 10:00)")
+    
+    # В 20:00 - для пятничной тренировки (18:00)
+    job_queue.run_daily(send_feedback_request, time=datetime.strptime("20:00", "%H:%M").time())
+    logger.info("Запланирована ежедневная задача на 20:00 (фидбэк для тренировки 18:00)")
     
     # Запуск бота
     logger.info("Бот запущен и ожидает команды...")
