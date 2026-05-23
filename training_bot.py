@@ -295,9 +295,12 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.info(f"ID опроса: {poll_answer.poll_id}")
         logger.info(f"Выбранные варианты: {poll_answer.option_ids}")
         
-        # Получаем информацию об опросе
-        poll = await context.bot.get_poll(poll_answer.poll_id)
-        question = poll.question
+        # Получаем информацию об опросе через get_message
+        message = await context.bot.get_message(
+            chat_id=poll_answer.voter_chat.id if hasattr(poll_answer, 'voter_chat') else GROUP_ID,
+            message_id=poll_answer.message_id
+        )
+        question = message.poll.question if message.poll else "Неизвестный опрос"
         
         logger.info(f"Вопрос опроса: {question}")
         
